@@ -1,0 +1,1255 @@
+import asyncio
+import sys
+import logging
+import platform
+import csv
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional, Callable, Any
+from dataclasses import dataclass, asdict
+from collections import deque
+import threading
+import queue
+import time
+import numpy as np
+import pandas as pd
+from scipy import signal
+from scipy.fft import fft, fftfreq
+import ast
+import matplotlib.pyplot as plt
+
+# Import your existing modules
+try:
+    from bleak.backends.client import BaseBleakClient
+    from enterble import DeviceScanner, FlowtimeCollector
+    COLLECTION_AVAILABLE = True
+except ImportError:
+    COLLECTION_AVAILABLE = False
+    logging.warning("Collection modules not available. Processing-only mode.")
+
+if sys.version_info < (3, 7):
+    asyncio.get_running_loop = asyncio._get_running_loop
+
+@dataclass
+class EEGConfig:
+    """Centralized configuration for the entire EEG system."""
+   
+    # Data Collection Settings
+    device_name: str = "Flowtime Headband"
+    model_nbr_uuid: str = "0000ff10-1212-abcd-1523-785feabcd123"
+    device_mac: str = "E8:5D:AE:34:8B:0B"
+    collection_duration: int = 300  # seconds
+   
+    # File Management
+    base_data_dir: str = r"C:\grad\headband\headband\PSYCHONOVA\Collected Data"
+    participant_name: str = "Default_Participant"
+    session_name: str = "Default_Session"
+    output_plots_dir: str = "eeg_plots"
+   
+    # Signal Processing Parameters
+    sampling_rate: int = 256
+    segment_length: float = 2.0  # seconds
+   
+    # Real-time Processing Parameters
+    realtime_enabled: bool = False
+    realtime_buffer_size: int = 2048  # samples to keep in buffer
+    realtime_window_size: float = 4.0  # seconds for real-time analysis
+    realtime_update_interval: float = 0.5  # seconds between updates
+    realtime_overlap: float = 0.5  # overlap between windows (0-1)
+   
+    # Filtering Parameters
+    lowcut_freq: float = 0.5
+    highcut_freq: float = 50.0
+    notch_freq: float = 60.0
+    filter_order: int = 5
+   
+    # Artifact Removal
+    artifact_threshold: float = 4.0
+    use_quality_check: bool = False
+   
+    # Feature Extraction
+    freq_bands: Dict[str, tuple] = None
+   
+    def __post_init__(self):
+        if self.freq_bands is None:
+            self.freq_bands = {
+                'delta': (0.5, 4),
+                'theta': (4, 8),
+                'alpha': (8, 12),
+                'beta': (12, 30),
+                'gamma': (30, 50)
+            }
+   
+    def get_data_file_path(self, file_type: str = "raw") -> str:
+        """Generate file paths based on configuration."""
+        participant_dir = Path(self.base_data_dir) / self.participant_name
+        participant_dir.mkdir(parents=True, exist_ok=True)
+       
+        if file_type == "raw":
+            return str(participant_dir / f"EEG_{self.session_name}.csv")
+        elif file_type == "features":
+            return str(participant_dir / f"EEG_features_{self.session_name}.csv")
+        elif file_type == "realtime_features":
+            return str(participant_dir / f"EEG_realtime_features_{self.session_name}.csv")
+        elif file_type == "config":
+            return str(participant_dir / f"config_{self.session_name}.json")
+        else:
+            return str(participant_dir / f"EEG_{file_type}_{self.session_name}.csv")
+   
+    def save_config(self, file_path: Optional[str] = None):
+        """Save configuration to JSON file."""
+        if file_path is None:
+            file_path = self.get_data_file_path("config")
+       
+        with open(file_path, 'w') as f:
+            json.dump(asdict(self), f, indent=2)
+   
+    @classmethod
+    def load_config(cls, file_path: str) -> 'EEGConfig':
+        """Load configuration from JSON file."""
+        with open(file_path, 'r') as f:
+            config_dict = json.load(f)
+        return cls(**config_dict)
+
+class RealTimeEEGBuffer:
+    """Thread-safe circular buffer for real-time EEG data processing."""
+   
+    def __init__(self, buffer_size: int, n_channels: int = 6):
+        self.buffer_size = buffer_size
+        self.n_channels = n_channels
+        self.buffer = np.zeros((buffer_size, n_channels))
+        self.write_index = 0
+        self.samples_written = 0
+        self.lock = threading.Lock()
+       
+    def add_samples(self, samples: np.ndarray):
+        """Add new samples to the buffer."""
+        with self.lock:
+            n_samples = samples.shape[0]
+           
+            for i in range(n_samples):
+                self.buffer[self.write_index] = samples[i]
+                self.write_index = (self.write_index + 1) % self.buffer_size
+                self.samples_written += 1
+   
+    def get_latest_window(self, window_samples: int) -> Optional[np.ndarray]:
+        """Get the latest window of samples."""
+        with self.lock:
+            if self.samples_written < window_samples:
+                return None
+           
+            # Get the most recent samples
+            if self.write_index >= window_samples:
+                return self.buffer[self.write_index - window_samples:self.write_index].copy()
+            else:
+                # Handle wraparound
+                part1 = self.buffer[self.write_index - window_samples:].copy()
+                part2 = self.buffer[:self.write_index].copy()
+                return np.vstack([part1, part2])
+   
+    def get_buffer_fill_ratio(self) -> float:
+        """Get the ratio of buffer that's been filled."""
+        return min(self.samples_written / self.buffer_size, 1.0)
+
+class RealTimeProcessor:
+    """Real-time EEG signal processor."""
+   
+    def __init__(self, config: EEGConfig, callback: Optional[Callable] = None):
+        self.config = config
+        self.callback = callback
+        self.logger = logging.getLogger(__name__ + ".RealTimeProcessor")
+       
+        # Initialize filters
+        self._setup_filters()
+       
+        # Processing state
+        self.filter_states = {}
+        self.last_processed_time = 0
+       
+        # Feature storage
+        self.realtime_features = []
+        self.features_file = None
+       
+    def _setup_filters(self):
+        """Setup filter coefficients."""
+        # Bandpass filter
+        nyq = 0.5 * self.config.sampling_rate
+        low = self.config.lowcut_freq / nyq
+        high = self.config.highcut_freq / nyq
+        self.bp_b, self.bp_a = signal.butter(self.config.filter_order, [low, high], btype='band')
+       
+        # Notch filter
+        self.notch_b, self.notch_a = signal.iirnotch(
+            self.config.notch_freq,
+            30,
+            self.config.sampling_rate
+        )
+       
+        self.logger.info("Real-time filters initialized")
+   
+    def apply_realtime_filters(self, data: np.ndarray) -> np.ndarray:
+        """Apply filters with state preservation for real-time processing."""
+        filtered_data = np.copy(data)
+       
+        # Apply filters to each channel
+        for ch in range(data.shape[1]):
+            channel_data = data[:, ch]
+           
+            # Bandpass filter with state
+            if f'bp_ch{ch}' not in self.filter_states:
+                filtered_ch, self.filter_states[f'bp_ch{ch}'] = signal.lfilter(
+                    self.bp_b, self.bp_a, channel_data, zi=signal.lfilter_zi(self.bp_b, self.bp_a) * channel_data[0]
+                )
+            else:
+                filtered_ch, self.filter_states[f'bp_ch{ch}'] = signal.lfilter(
+                    self.bp_b, self.bp_a, channel_data, zi=self.filter_states[f'bp_ch{ch}']
+                )
+           
+            # Notch filter with state
+            if f'notch_ch{ch}' not in self.filter_states:
+                filtered_ch, self.filter_states[f'notch_ch{ch}'] = signal.lfilter(
+                    self.notch_b, self.notch_a, filtered_ch, zi=signal.lfilter_zi(self.notch_b, self.notch_a) * filtered_ch[0]
+                )
+            else:
+                filtered_ch, self.filter_states[f'notch_ch{ch}'] = signal.lfilter(
+                    self.notch_b, self.notch_a, filtered_ch, zi=self.filter_states[f'notch_ch{ch}']
+                )
+           
+            filtered_data[:, ch] = filtered_ch
+       
+        return filtered_data
+   
+    def detect_artifacts_realtime(self, data: np.ndarray) -> np.ndarray:
+        """Real-time artifact detection and marking."""
+        # Use sliding window z-score for artifact detection
+        window_size = min(len(data), self.config.sampling_rate)  # 1 second window
+        artifact_mask = np.zeros(data.shape, dtype=bool)
+       
+        for ch in range(data.shape[1]):
+            channel_data = data[:, ch]
+           
+            # Rolling z-score calculation
+            for i in range(window_size, len(channel_data)):
+                window = channel_data[i-window_size:i]
+                z_score = np.abs((channel_data[i] - np.mean(window)) / np.std(window))
+               
+                if z_score > self.config.artifact_threshold:
+                    artifact_mask[i, ch] = True
+       
+        return artifact_mask
+   
+    def compute_realtime_features(self, data: np.ndarray, timestamp: datetime) -> Dict[str, Any]:
+        """Compute features for real-time analysis."""
+        features = {
+            'timestamp': timestamp.isoformat(),
+            'window_length': len(data),
+            'sampling_rate': self.config.sampling_rate
+        }
+       
+        channel_labels = ['F1_0', 'F1_1', 'F1_2', 'F2_0', 'F2_1', 'F2_2']
+       
+        # Detect artifacts
+        artifact_mask = self.detect_artifacts_realtime(data)
+       
+        for ch_idx, ch_label in enumerate(channel_labels):
+            channel_data = data[:, ch_idx]
+           
+            # Artifact statistics
+            artifact_ratio = np.sum(artifact_mask[:, ch_idx]) / len(channel_data)
+            features[f'{ch_label}_artifact_ratio'] = artifact_ratio
+           
+            # Skip heavily contaminated channels
+            if artifact_ratio > 0.5:
+                self.logger.warning(f"Channel {ch_label} heavily contaminated ({artifact_ratio:.2%})")
+                continue
+           
+            # Basic time-domain features
+            features[f'{ch_label}_mean'] = np.mean(channel_data)
+            features[f'{ch_label}_std'] = np.std(channel_data)
+            features[f'{ch_label}_rms'] = np.sqrt(np.mean(channel_data**2))
+            features[f'{ch_label}_peak_to_peak'] = np.ptp(channel_data)
+           
+            # Frequency domain features
+            try:
+                freqs, psd = signal.welch(
+                    channel_data,
+                    fs=self.config.sampling_rate,
+                    nperseg=min(len(channel_data), self.config.sampling_rate * 2),
+                    noverlap=None
+                )
+               
+                total_power = np.trapz(psd, freqs)
+                features[f'{ch_label}_total_power'] = total_power
+               
+                # Band power analysis
+                for band, (low, high) in self.config.freq_bands.items():
+                    band_idx = (freqs >= low) & (freqs <= high)
+                    if np.any(band_idx):
+                        band_power = np.trapz(psd[band_idx], freqs[band_idx])
+                        features[f'{ch_label}_{band}_power'] = band_power
+                        features[f'{ch_label}_{band}_relative_power'] = (
+                            band_power / total_power if total_power > 0 else 0
+                        )
+                       
+                        # Peak frequency in band
+                        if np.any(psd[band_idx]):
+                            peak_freq_idx = np.argmax(psd[band_idx])
+                            features[f'{ch_label}_{band}_peak_freq'] = freqs[band_idx][peak_freq_idx]
+               
+                # Spectral centroid
+                spectral_centroid = np.sum(freqs * psd) / np.sum(psd) if np.sum(psd) > 0 else 0
+                features[f'{ch_label}_spectral_centroid'] = spectral_centroid
+               
+            except Exception as e:
+                self.logger.warning(f"Failed to compute frequency features for {ch_label}: {e}")
+       
+        # Cross-channel features
+        try:
+            # Coherence between left and right channels
+            for i in range(3):  # F1_0-F1_2 vs F2_0-F2_2
+                left_ch = data[:, i]
+                right_ch = data[:, i + 3]
+               
+                # Correlation
+                if len(left_ch) > 1 and len(right_ch) > 1:
+                    correlation = np.corrcoef(left_ch, right_ch)[0, 1]
+                    if not np.isnan(correlation):
+                        features[f'coherence_F1_{i}_F2_{i}'] = correlation
+               
+        except Exception as e:
+            self.logger.warning(f"Failed to compute cross-channel features: {e}")
+       
+        return features
+   
+    def process_window(self, data: np.ndarray, timestamp: datetime) -> Dict[str, Any]:
+        """Process a window of data in real-time."""
+        try:
+            # Apply filters
+            filtered_data = self.apply_realtime_filters(data)
+           
+            # Compute features
+            features = self.compute_realtime_features(filtered_data, timestamp)
+           
+            # Store features
+            self.realtime_features.append(features)
+           
+            # Save to file if configured
+            if self.features_file:
+                self._save_realtime_features(features)
+           
+            # Callback for external processing
+            if self.callback:
+                try:
+                    self.callback(features, filtered_data)
+                except Exception as e:
+                    self.logger.error(f"Callback error: {e}")
+           
+            return features
+           
+        except Exception as e:
+            self.logger.error(f"Real-time processing error: {e}")
+            return {}
+   
+    def _save_realtime_features(self, features: Dict[str, Any]):
+        """Save real-time features to file."""
+        try:
+            features_df = pd.DataFrame([features])
+           
+            # Check if file exists to decide on header
+            file_exists = Path(self.features_file).exists()
+           
+            features_df.to_csv(
+                self.features_file,
+                mode='a',
+                header=not file_exists,
+                index=False
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to save real-time features: {e}")
+   
+    def start_feature_logging(self, file_path: str):
+        """Start logging features to file."""
+        self.features_file = file_path
+        self.logger.info(f"Started real-time feature logging to: {file_path}")
+   
+    def stop_feature_logging(self):
+        """Stop logging features to file."""
+        self.features_file = None
+        self.logger.info("Stopped real-time feature logging")
+   
+    def get_recent_features(self, n: int = 10) -> List[Dict[str, Any]]:
+        """Get the most recent n feature sets."""
+        return self.realtime_features[-n:] if len(self.realtime_features) >= n else self.realtime_features.copy()
+
+class EEGDataCollector:
+    """Wrapper for the data collection functionality with real-time processing."""
+   
+    def __init__(self, config: EEGConfig):
+        self.config = config
+        self.logger = logging.getLogger(__name__ + ".Collector")
+       
+        if not COLLECTION_AVAILABLE:
+            raise ImportError("Collection modules not available")
+       
+        # Real-time processing components
+        if self.config.realtime_enabled:
+            self.buffer = RealTimeEEGBuffer(
+                self.config.realtime_buffer_size,
+                n_channels=6
+            )
+            self.realtime_processor = RealTimeProcessor(config)
+            self.processing_thread = None
+            self.stop_processing = threading.Event()
+   
+    async def collect_data(self, progress_callback: Optional[Callable] = None) -> str:
+        """Collect EEG data with optional real-time processing."""
+        csv_file = self.config.get_data_file_path("raw")
+       
+        self.logger.info(f"Starting data collection for {self.config.collection_duration}s")
+        self.logger.info(f"Real-time processing: {'Enabled' if self.config.realtime_enabled else 'Disabled'}")
+        self.logger.info(f"Saving to: {csv_file}")
+       
+        # Save configuration alongside data
+        self.config.save_config()
+       
+        # Start real-time processing if enabled
+        if self.config.realtime_enabled:
+            self._start_realtime_processing()
+       
+        with open(csv_file, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Timestamp', 'Data Type', 'Left Channel', 'Right Channel'])
+           
+            # Callback functions
+            async def device_disconnected(device: BaseBleakClient) -> None:
+                self.logger.info(f'Device disconnected: {device}')
+           
+            async def soc_callback(soc: float) -> None:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                self.logger.info(f'Battery SOC: {soc}')
+                writer.writerow([timestamp, 'Battery SOC', soc, ''])
+           
+            async def wear_status_callback(wear_status: bool) -> None:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                self.logger.info(f'Wear status: {wear_status}')
+                writer.writerow([timestamp, 'Wear Status', wear_status, ''])
+           
+            async def eeg_data_collector(data: List[int]) -> None:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+               
+                if len(data) == 20:
+                    left_channel = [
+                        tuple(data[2:5]),
+                        tuple(data[8:11]),
+                        tuple(data[14:17])
+                    ]
+                   
+                    right_channel = [
+                        tuple(data[5:8]),
+                        tuple(data[11:14]),
+                        tuple(data[17:20])
+                    ]
+                   
+                    writer.writerow([timestamp, 'EEG Data', left_channel, right_channel])
+                   
+                    # Add to real-time buffer if enabled
+                    if self.config.realtime_enabled:
+                        try:
+                            # Convert to numpy array for buffer
+                            samples = np.array([
+                                list(left_channel[0]) + list(right_channel[0]),
+                                list(left_channel[1]) + list(right_channel[1]),
+                                list(left_channel[2]) + list(right_channel[2])
+                            ])
+                            self.buffer.add_samples(samples)
+                        except Exception as e:
+                            self.logger.error(f"Failed to add samples to buffer: {e}")
+                   
+                    if progress_callback:
+                        await progress_callback("eeg_data", data)
+           
+            async def hr_data_collector(data: int):
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                self.logger.info(f'Heart Rate Data: {data}')
+                writer.writerow([timestamp, 'Heart Rate', data, ''])
+               
+                if progress_callback:
+                    await progress_callback("heart_rate", data)
+           
+            # Initialize collector
+            collector = FlowtimeCollector(
+                name=self.config.device_name,
+                model_nbr_uuid=self.config.model_nbr_uuid,
+                device_identify=self.config.device_mac,
+                device_disconnected_callback=device_disconnected,
+                soc_data_callback=soc_callback,
+                wear_status_callback=wear_status_callback,
+                eeg_data_callback=eeg_data_collector,
+                hr_data_callback=hr_data_collector,
+            )
+           
+            # Start collection
+            await collector.start()
+           
+            # Progress tracking
+            start_time = datetime.now()
+            for i in range(self.config.collection_duration):
+                await asyncio.sleep(1)
+                if progress_callback:
+                    progress = (i + 1) / self.config.collection_duration * 100
+                    await progress_callback("progress", progress)
+           
+            await collector.stop()
+       
+        # Stop real-time processing
+        if self.config.realtime_enabled:
+            self._stop_realtime_processing()
+       
+        self.logger.info(f"Data collection completed. File saved: {csv_file}")
+        return csv_file
+   
+    def _start_realtime_processing(self):
+        """Start the real-time processing thread."""
+        if self.processing_thread is not None:
+            return
+       
+        # Setup real-time feature logging
+        rt_features_file = self.config.get_data_file_path("realtime_features")
+        self.realtime_processor.start_feature_logging(rt_features_file)
+       
+        self.stop_processing.clear()
+        self.processing_thread = threading.Thread(target=self._realtime_processing_loop)
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
+       
+        self.logger.info("Real-time processing thread started")
+   
+    def _stop_realtime_processing(self):
+        """Stop the real-time processing thread."""
+        if self.processing_thread is None:
+            return
+       
+        self.stop_processing.set()
+        self.processing_thread.join(timeout=5)
+        self.processing_thread = None
+       
+        self.realtime_processor.stop_feature_logging()
+        self.logger.info("Real-time processing thread stopped")
+   
+    def _realtime_processing_loop(self):
+        """Main real-time processing loop."""
+        window_samples = int(self.config.realtime_window_size * self.config.sampling_rate)
+        update_interval = self.config.realtime_update_interval
+       
+        last_update = time.time()
+       
+        while not self.stop_processing.is_set():
+            try:
+                current_time = time.time()
+               
+                # Check if it's time for an update
+                if current_time - last_update >= update_interval:
+                    # Get latest window from buffer
+                    window_data = self.buffer.get_latest_window(window_samples)
+                   
+                    if window_data is not None:
+                        # Process the window
+                        timestamp = datetime.now()
+                        features = self.realtime_processor.process_window(window_data, timestamp)
+                       
+                        if features:
+                            self.logger.debug(f"Processed real-time window: {len(features)} features")
+                   
+                    last_update = current_time
+               
+                # Small sleep to prevent busy waiting
+                time.sleep(0.01)
+               
+            except Exception as e:
+                self.logger.error(f"Real-time processing loop error: {e}")
+                time.sleep(0.1)
+   
+    def get_realtime_status(self) -> Dict[str, Any]:
+        """Get real-time processing status."""
+        if not self.config.realtime_enabled:
+            return {'enabled': False}
+       
+        return {
+            'enabled': True,
+            'processing_active': self.processing_thread is not None and self.processing_thread.is_alive(),
+            'buffer_fill_ratio': self.buffer.get_buffer_fill_ratio(),
+            'recent_features_count': len(self.realtime_processor.realtime_features),
+            'features_file': self.realtime_processor.features_file
+        }
+
+class EEGDataProcessor:
+    """Wrapper for the data processing functionality."""
+   
+    def __init__(self, config: EEGConfig):
+        self.config = config
+        self.logger = logging.getLogger(__name__ + ".Processor")
+       
+        # Create output directory
+        self.output_dir = Path(self.config.base_data_dir) / self.config.participant_name / self.config.output_plots_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+   
+    def load_eeg_data(self, file_path: str) -> pd.DataFrame:
+        """Load and parse EEG data from CSV."""
+        try:
+            df = pd.read_csv(file_path)
+            self.logger.info(f"Loaded EEG data with {len(df)} records")
+           
+            eeg_df = df[df['Data Type'] == 'EEG Data'].copy()
+           
+            def parse_tuple_list(tuple_str):
+                try:
+                    if pd.isna(tuple_str):
+                        return np.array([])
+                    tuple_list = ast.literal_eval(tuple_str)
+                    valid_tuples = []
+                    for t in tuple_list:
+                        if len(t) == 3:
+                            try:
+                                valid_tuples.append([float(x) for x in t])
+                            except (ValueError, TypeError) as e:
+                                self.logger.warning(f"Invalid tuple values: {t}")
+                                continue
+                    return np.array(valid_tuples) if valid_tuples else np.array([])
+                except (ValueError, SyntaxError) as e:
+                    self.logger.warning(f"Error parsing tuple string: {tuple_str}")
+                    return np.array([])
+           
+            eeg_df['F1'] = eeg_df['Left Channel'].apply(parse_tuple_list)
+            eeg_df['F2'] = eeg_df['Right Channel'].apply(parse_tuple_list)
+           
+            eeg_df = eeg_df[
+                (eeg_df['F1'].apply(len) > 0) &
+                (eeg_df['F2'].apply(len) > 0)
+            ]
+           
+            self.logger.info(f"EEG records after parsing: {len(eeg_df)}")
+           
+            if self.config.use_quality_check:
+                # Implement quality check logic here
+                pass
+           
+            return eeg_df
+           
+        except Exception as e:
+            self.logger.error(f"Failed to load EEG data: {str(e)}")
+            raise
+   
+    def apply_filters(self, data: np.ndarray) -> np.ndarray:
+        """Apply bandpass and notch filters."""
+        try:
+            def butter_bandpass(lowcut, highcut, fs, order):
+                nyq = 0.5 * fs
+                low = lowcut / nyq
+                high = highcut / nyq
+                b, a = signal.butter(order, [low, high], btype='band')
+                return b, a
+           
+            def notch_filter(freq, fs, quality_factor=30):
+                b, a = signal.iirnotch(freq, quality_factor, fs)
+                return b, a
+           
+            filtered_data = np.copy(data)
+           
+            # Bandpass filter
+            b, a = butter_bandpass(
+                self.config.lowcut_freq,
+                self.config.highcut_freq,
+                self.config.sampling_rate,
+                self.config.filter_order
+            )
+            for i in range(data.shape[1]):
+                filtered_data[:, i] = signal.filtfilt(b, a, data[:, i])
+           
+            # Notch filter
+            b, a = notch_filter(self.config.notch_freq, self.config.sampling_rate)
+            for i in range(data.shape[1]):
+                filtered_data[:, i] = signal.filtfilt(b, a, filtered_data[:, i])
+           
+            self.logger.info("Applied bandpass and notch filters")
+            return filtered_data
+           
+        except Exception as e:
+            self.logger.error(f"Filtering failed: {str(e)}")
+            raise
+   
+    def remove_artifacts(self, data: np.ndarray) -> np.ndarray:
+        """Remove artifacts using z-score thresholding."""
+        try:
+            z_scores = (data - np.mean(data, axis=0)) / np.std(data, axis=0)
+            outliers = np.abs(z_scores) > self.config.artifact_threshold
+            cleaned_data = np.copy(data)
+           
+            for i in range(data.shape[1]):
+                median = np.median(data[:, i])
+                cleaned_data[outliers[:, i], i] = median
+           
+            self.logger.info(f"Removed artifacts from {np.sum(outliers)} samples")
+            return cleaned_data
+           
+        except Exception as e:
+            self.logger.error(f"Artifact removal failed: {str(e)}")
+            raise
+   
+    def normalize_data(self, data: np.ndarray) -> np.ndarray:
+        """Normalize data to zero mean and unit variance."""
+        try:
+            normalized_data = (data - np.mean(data, axis=0)) / np.std(data, axis=0)
+            self.logger.info("Normalized EEG data")
+            return normalized_data
+        except Exception as e:
+            self.logger.error(f"Normalization failed: {str(e)}")
+            raise
+    def segment_data(self, data: np.ndarray) -> np.ndarray:
+        """Segment data into fixed-length windows."""
+        try:
+            samples_per_segment = int(self.config.sampling_rate * self.config.segment_length)
+            n_segments = len(data) // samples_per_segment
+            segments = data[:n_segments * samples_per_segment].reshape(n_segments, samples_per_segment, -1)
+           
+            self.logger.info(f"Segmented data into {n_segments} segments of {samples_per_segment} samples each")
+            return segments
+           
+        except Exception as e:
+            self.logger.error(f"Data segmentation failed: {str(e)}")
+            raise
+   
+    def extract_features(self, data: np.ndarray) -> pd.DataFrame:
+        """Extract comprehensive features from EEG data."""
+        try:
+            features_list = []
+            channel_labels = ['F1_0', 'F1_1', 'F1_2', 'F2_0', 'F2_1', 'F2_2']
+           
+            # If data is segmented (3D), process each segment
+            if data.ndim == 3:
+                for seg_idx in range(data.shape[0]):
+                    segment = data[seg_idx]
+                    seg_features = self._extract_segment_features(segment, seg_idx, channel_labels)
+                    features_list.append(seg_features)
+            else:
+                # Process entire data as one segment
+                seg_features = self._extract_segment_features(data, 0, channel_labels)
+                features_list.append(seg_features)
+           
+            features_df = pd.DataFrame(features_list)
+            self.logger.info(f"Extracted features for {len(features_list)} segments")
+            return features_df
+           
+        except Exception as e:
+            self.logger.error(f"Feature extraction failed: {str(e)}")
+            raise
+   
+    def _extract_segment_features(self, segment: np.ndarray, seg_idx: int, channel_labels: List[str]) -> Dict[str, Any]:
+        """Extract features from a single segment."""
+        features = {
+            'segment_index': seg_idx,
+            'segment_length': len(segment),
+            'timestamp': datetime.now().isoformat()
+        }
+       
+        for ch_idx, ch_label in enumerate(channel_labels):
+            if ch_idx >= segment.shape[1]:
+                continue
+               
+            channel_data = segment[:, ch_idx]
+           
+            # Time-domain features
+            features[f'{ch_label}_mean'] = np.mean(channel_data)
+            features[f'{ch_label}_std'] = np.std(channel_data)
+            features[f'{ch_label}_var'] = np.var(channel_data)
+            features[f'{ch_label}_rms'] = np.sqrt(np.mean(channel_data**2))
+            features[f'{ch_label}_peak_to_peak'] = np.ptp(channel_data)
+            features[f'{ch_label}_skewness'] = self._calculate_skewness(channel_data)
+            features[f'{ch_label}_kurtosis'] = self._calculate_kurtosis(channel_data)
+           
+            # Frequency-domain features
+            try:
+                freqs, psd = signal.welch(
+                    channel_data,
+                    fs=self.config.sampling_rate,
+                    nperseg=min(len(channel_data), self.config.sampling_rate * 2)
+                )
+               
+                total_power = np.trapz(psd, freqs)
+                features[f'{ch_label}_total_power'] = total_power
+               
+                # Band power features
+                for band, (low, high) in self.config.freq_bands.items():
+                    band_idx = (freqs >= low) & (freqs <= high)
+                    if np.any(band_idx):
+                        band_power = np.trapz(psd[band_idx], freqs[band_idx])
+                        features[f'{ch_label}_{band}_power'] = band_power
+                        features[f'{ch_label}_{band}_relative_power'] = (
+                            band_power / total_power if total_power > 0 else 0
+                        )
+                       
+                        # Peak frequency in band
+                        if np.any(psd[band_idx]):
+                            peak_freq_idx = np.argmax(psd[band_idx])
+                            features[f'{ch_label}_{band}_peak_freq'] = freqs[band_idx][peak_freq_idx]
+               
+                # Spectral features
+                features[f'{ch_label}_spectral_centroid'] = np.sum(freqs * psd) / np.sum(psd) if np.sum(psd) > 0 else 0
+                features[f'{ch_label}_spectral_bandwidth'] = self._calculate_spectral_bandwidth(freqs, psd)
+                features[f'{ch_label}_spectral_rolloff'] = self._calculate_spectral_rolloff(freqs, psd)
+               
+            except Exception as e:
+                self.logger.warning(f"Failed to compute frequency features for {ch_label}: {e}")
+       
+        # Cross-channel features
+        try:
+            if segment.shape[1] >= 6:  # Ensure we have all channels
+                # Coherence between left and right hemisphere channels
+                for i in range(3):
+                    left_ch = segment[:, i]
+                    right_ch = segment[:, i + 3]
+                   
+                    if len(left_ch) > 1 and len(right_ch) > 1:
+                        correlation = np.corrcoef(left_ch, right_ch)[0, 1]
+                        if not np.isnan(correlation):
+                            features[f'coherence_F1_{i}_F2_{i}'] = correlation
+               
+                # Average power ratios
+                f1_power = np.mean([features.get(f'F1_{i}_total_power', 0) for i in range(3)])
+                f2_power = np.mean([features.get(f'F2_{i}_total_power', 0) for i in range(3)])
+                features['hemispheric_asymmetry'] = (f1_power - f2_power) / (f1_power + f2_power) if (f1_power + f2_power) > 0 else 0
+               
+        except Exception as e:
+            self.logger.warning(f"Failed to compute cross-channel features: {e}")
+       
+        return features
+   
+    def _calculate_skewness(self, data: np.ndarray) -> float:
+        """Calculate skewness of the data."""
+        try:
+            mean = np.mean(data)
+            std = np.std(data)
+            if std == 0:
+                return 0
+            return np.mean(((data - mean) / std) ** 3)
+        except:
+            return 0
+   
+    def _calculate_kurtosis(self, data: np.ndarray) -> float:
+        """Calculate kurtosis of the data."""
+        try:
+            mean = np.mean(data)
+            std = np.std(data)
+            if std == 0:
+                return 0
+            return np.mean(((data - mean) / std) ** 4) - 3
+        except:
+            return 0
+   
+    def _calculate_spectral_bandwidth(self, freqs: np.ndarray, psd: np.ndarray) -> float:
+        """Calculate spectral bandwidth."""
+        try:
+            centroid = np.sum(freqs * psd) / np.sum(psd) if np.sum(psd) > 0 else 0
+            bandwidth = np.sqrt(np.sum(((freqs - centroid) ** 2) * psd) / np.sum(psd)) if np.sum(psd) > 0 else 0
+            return bandwidth
+        except:
+            return 0
+   
+    def _calculate_spectral_rolloff(self, freqs: np.ndarray, psd: np.ndarray, rolloff_percent: float = 0.85) -> float:
+        """Calculate spectral rolloff frequency."""
+        try:
+            total_power = np.sum(psd)
+            if total_power == 0:
+                return 0
+           
+            cumsum_power = np.cumsum(psd)
+            rolloff_threshold = rolloff_percent * total_power
+            rolloff_idx = np.where(cumsum_power >= rolloff_threshold)[0]
+           
+            if len(rolloff_idx) > 0:
+                return freqs[rolloff_idx[0]]
+            else:
+                return freqs[-1]
+        except:
+            return 0
+   
+    def create_visualizations(self, data: np.ndarray, features_df: pd.DataFrame = None) -> List[str]:
+        """Create comprehensive visualizations."""
+        try:
+            plot_files = []
+            channel_labels = ['F1_0', 'F1_1', 'F1_2', 'F2_0', 'F2_1', 'F2_2']
+           
+            # 1. Raw EEG Time Series Plot
+            plt.figure(figsize=(15, 10))
+            for i, label in enumerate(channel_labels):
+                if i < data.shape[1]:
+                    plt.subplot(3, 2, i + 1)
+                    time_axis = np.arange(len(data)) / self.config.sampling_rate
+                    plt.plot(time_axis, data[:, i])
+                    plt.title(f'Channel {label}')
+                    plt.xlabel('Time (s)')
+                    plt.ylabel('Amplitude (μV)')
+                    plt.grid(True, alpha=0.3)
+           
+            plt.tight_layout()
+            time_series_file = self.output_dir / f"eeg_time_series_{self.config.session_name}.png"
+            plt.savefig(time_series_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            plot_files.append(str(time_series_file))
+           
+            # 2. Power Spectral Density Plot
+            plt.figure(figsize=(15, 10))
+            for i, label in enumerate(channel_labels):
+                if i < data.shape[1]:
+                    plt.subplot(3, 2, i + 1)
+                    freqs, psd = signal.welch(
+                        data[:, i],
+                        fs=self.config.sampling_rate,
+                        nperseg=min(len(data), self.config.sampling_rate * 4)
+                    )
+                    plt.semilogy(freqs, psd)
+                    plt.title(f'PSD - Channel {label}')
+                    plt.xlabel('Frequency (Hz)')
+                    plt.ylabel('Power Spectral Density')
+                    plt.xlim(0, 50)
+                    plt.grid(True, alpha=0.3)
+           
+            plt.tight_layout()
+            psd_file = self.output_dir / f"eeg_psd_{self.config.session_name}.png"
+            plt.savefig(psd_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            plot_files.append(str(psd_file))
+           
+            # 3. Band Power Visualization
+            if features_df is not None and not features_df.empty:
+                self._plot_band_powers(features_df, plot_files)
+           
+            # 4. Spectrogram
+            plt.figure(figsize=(15, 8))
+            for i, label in enumerate(channel_labels[:4]):  # Show first 4 channels
+                if i < data.shape[1]:
+                    plt.subplot(2, 2, i + 1)
+                    f, t, Sxx = signal.spectrogram(
+                        data[:, i],
+                        fs=self.config.sampling_rate,
+                        nperseg=min(256, len(data)//4)
+                    )
+                    plt.pcolormesh(t, f, 10 * np.log10(Sxx), shading='gouraud')
+                    plt.title(f'Spectrogram - Channel {label}')
+                    plt.xlabel('Time (s)')
+                    plt.ylabel('Frequency (Hz)')
+                    plt.ylim(0, 50)
+                    plt.colorbar(label='Power (dB)')
+           
+            plt.tight_layout()
+            spectrogram_file = self.output_dir / f"eeg_spectrogram_{self.config.session_name}.png"
+            plt.savefig(spectrogram_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            plot_files.append(str(spectrogram_file))
+           
+            # 5. Correlation Matrix
+            if data.shape[1] > 1:
+                plt.figure(figsize=(10, 8))
+                correlation_matrix = np.corrcoef(data.T)
+                im = plt.imshow(correlation_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+                plt.colorbar(im, label='Correlation Coefficient')
+                plt.title('Channel Correlation Matrix')
+                plt.xticks(range(len(channel_labels[:data.shape[1]])), channel_labels[:data.shape[1]])
+                plt.yticks(range(len(channel_labels[:data.shape[1]])), channel_labels[:data.shape[1]])
+               
+                # Add correlation values as text
+                for i in range(correlation_matrix.shape[0]):
+                    for j in range(correlation_matrix.shape[1]):
+                        plt.text(j, i, f'{correlation_matrix[i, j]:.2f}',
+                                ha='center', va='center', color='black')
+               
+                plt.tight_layout()
+                corr_file = self.output_dir / f"eeg_correlation_{self.config.session_name}.png"
+                plt.savefig(corr_file, dpi=300, bbox_inches='tight')
+                plt.close()
+                plot_files.append(str(corr_file))
+           
+            self.logger.info(f"Created {len(plot_files)} visualization files")
+            return plot_files
+           
+        except Exception as e:
+            self.logger.error(f"Visualization creation failed: {str(e)}")
+            return []
+   
+    def _plot_band_powers(self, features_df: pd.DataFrame, plot_files: List[str]):
+        """Create band power visualization plots."""
+        try:
+            bands = list(self.config.freq_bands.keys())
+            channel_labels = ['F1_0', 'F1_1', 'F1_2', 'F2_0', 'F2_1', 'F2_2']
+           
+            # Band power comparison across channels
+            plt.figure(figsize=(15, 10))
+           
+            for band_idx, band in enumerate(bands):
+                plt.subplot(2, 3, band_idx + 1)
+               
+                band_powers = []
+                for ch_label in channel_labels:
+                    power_col = f'{ch_label}_{band}_power'
+                    if power_col in features_df.columns:
+                        band_powers.append(features_df[power_col].mean())
+                    else:
+                        band_powers.append(0)
+               
+                plt.bar(range(len(channel_labels)), band_powers)
+                plt.title(f'{band.capitalize()} Band Power ({self.config.freq_bands[band][0]}-{self.config.freq_bands[band][1]} Hz)')
+                plt.xlabel('Channel')
+                plt.ylabel('Power')
+                plt.xticks(range(len(channel_labels)), channel_labels, rotation=45)
+                plt.grid(True, alpha=0.3)
+           
+            plt.tight_layout()
+            band_power_file = self.output_dir / f"eeg_band_powers_{self.config.session_name}.png"
+            plt.savefig(band_power_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            plot_files.append(str(band_power_file))
+           
+        except Exception as e:
+            self.logger.warning(f"Failed to create band power plots: {e}")
+   
+    def process_data(self, file_path: str) -> Dict[str, Any]:
+        """Complete data processing pipeline."""
+        try:
+            self.logger.info("Starting EEG data processing pipeline")
+           
+            # Load data
+            eeg_df = self.load_eeg_data(file_path)
+           
+            if eeg_df.empty:
+                raise ValueError("No valid EEG data found")
+           
+            # Convert to numpy array
+            all_data = []
+            for _, row in eeg_df.iterrows():
+                f1_data = row['F1']
+                f2_data = row['F2']
+               
+                if len(f1_data) > 0 and len(f2_data) > 0:
+                    combined = np.hstack([f1_data.flatten(), f2_data.flatten()])
+                    if len(combined) == 6:  # Ensure we have 6 channels
+                        all_data.append(combined)
+           
+            if not all_data:
+                raise ValueError("No valid data points found")
+           
+            data = np.array(all_data)
+            self.logger.info(f"Loaded data shape: {data.shape}")
+           
+            # Apply preprocessing
+            filtered_data = self.apply_filters(data)
+            cleaned_data = self.remove_artifacts(filtered_data)
+            normalized_data = self.normalize_data(cleaned_data)
+           
+            # Segment data
+            segmented_data = self.segment_data(normalized_data)
+           
+            # Extract features
+            features_df = self.extract_features(segmented_data)
+           
+            # Save features
+            features_file = self.config.get_data_file_path("features")
+            features_df.to_csv(features_file, index=False)
+            self.logger.info(f"Features saved to: {features_file}")
+           
+            # Create visualizations
+            plot_files = self.create_visualizations(normalized_data, features_df)
+           
+            # Summary statistics
+            summary = {
+                'total_samples': len(data),
+                'total_segments': len(segmented_data),
+                'features_extracted': len(features_df.columns),
+                'processing_duration': f"{self.config.segment_length}s segments",
+                'output_files': {
+                    'features': features_file,
+                    'plots': plot_files
+                },
+                'data_quality': {
+                    'mean_amplitude': np.mean(np.abs(normalized_data)),
+                    'snr_estimate': self._estimate_snr(normalized_data)
+                }
+            }
+           
+            self.logger.info("EEG data processing completed successfully")
+            return summary
+           
+        except Exception as e:
+            self.logger.error(f"Data processing failed: {str(e)}")
+            raise
+   
+    def _estimate_snr(self, data: np.ndarray) -> float:
+        """Estimate signal-to-noise ratio."""
+        try:
+            signal_power = np.mean(data ** 2)
+            # Simple noise estimation using high-frequency content
+            diff = np.diff(data, axis=0)
+            noise_power = np.mean(diff ** 2)
+           
+            if noise_power > 0:
+                snr = 10 * np.log10(signal_power / noise_power)
+                return float(snr)
+            else:
+                return float('inf')
+        except:
+            return 0.0
+
+class EEGSystemManager:
+    """Main system manager that coordinates collection and processing."""
+   
+    def __init__(self, config: EEGConfig):
+        self.config = config
+        self.logger = logging.getLogger(__name__ + ".SystemManager")
+       
+        # Initialize components based on availability
+        self.collector = None
+        if COLLECTION_AVAILABLE:
+            try:
+                self.collector = EEGDataCollector(config)
+            except ImportError:
+                self.logger.warning("Collection functionality not available")
+       
+        self.processor = EEGDataProcessor(config)
+   
+    async def run_collection_session(self, progress_callback: Optional[Callable] = None) -> str:
+        """Run a complete data collection session."""
+        if self.collector is None:
+            raise RuntimeError("Data collection not available")
+       
+        self.logger.info(f"Starting EEG collection session: {self.config.session_name}")
+       
+        try:
+            csv_file = await self.collector.collect_data(progress_callback)
+            self.logger.info(f"Collection completed successfully: {csv_file}")
+            return csv_file
+        except Exception as e:
+            self.logger.error(f"Collection failed: {e}")
+            raise
+   
+    def run_processing_session(self, data_file: str) -> Dict[str, Any]:
+        """Run a complete data processing session."""
+        self.logger.info(f"Starting EEG processing session for: {data_file}")
+       
+        try:
+            results = self.processor.process_data(data_file)
+            self.logger.info("Processing completed successfully")
+            return results
+        except Exception as e:
+            self.logger.error(f"Processing failed: {e}")
+            raise
+   
+    async def run_full_session(self, progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
+        """Run both collection and processing in sequence."""
+        self.logger.info("Starting full EEG session (collection + processing)")
+       
+        try:
+            # Collection phase
+            csv_file = await self.run_collection_session(progress_callback)
+           
+            # Processing phase
+            processing_results = self.run_processing_session(csv_file)
+           
+            return {
+                'collection_file': csv_file,
+                'processing_results': processing_results,
+                'config_file': self.config.get_data_file_path("config")
+            }
+           
+        except Exception as e:
+            self.logger.error(f"Full session failed: {e}")
+            raise
+   
+    def get_system_status(self) -> Dict[str, Any]:
+        """Get current system status."""
+        status = {
+            'collection_available': self.collector is not None,
+            'processing_available': True,
+            'config': {
+                'participant': self.config.participant_name,
+                'session': self.config.session_name,
+                'realtime_enabled': self.config.realtime_enabled,
+                'collection_duration': self.config.collection_duration
+            }
+        }
+       
+        if self.collector is not None:
+            status['realtime_status'] = self.collector.get_realtime_status()
+       
+        return status
+
+# Example usage and configuration
+def create_example_config() -> EEGConfig:
+    """Create an example configuration."""
+    return EEGConfig(
+        participant_name="Subject_001",
+        session_name="baseline_recording",
+        collection_duration=300,  # 5 minutes
+        realtime_enabled=True,
+        realtime_window_size=4.0,
+        realtime_update_interval=0.5,
+        base_data_dir=r"C:\grad\headband\headband\PSYCHONOVA\Collected Data"
+    )
+
+# Main execution example
+async def main():
+    """Example main function demonstrating system usage."""
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('eeg_system.log'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+   
+    # Create configuration
+    config = create_example_config()
+   
+    # Initialize system
+    system = EEGSystemManager(config)
+   
+    # Check system status
+    status = system.get_system_status()
+    print(f"System Status: {status}")
+   
+    try:
+        if status['collection_available']:
+            # Run full session (collection + processing)
+            async def progress_callback(event_type, data):
+                if event_type == "progress":
+                    print(f"Collection progress: {data:.1f}%")
+                elif event_type == "eeg_data":
+                    print(f"EEG data received: {len(data)} samples")
+           
+            results = await system.run_full_session(progress_callback)
+            print(f"Session completed successfully!")
+            print(f"Results: {results}")
+           
+        else:
+            # Processing only mode
+            print("Collection not available. Please specify a data file for processing.")
+            # Uncomment and modify the following line to process existing data:
+            # results = system.run_processing_session("path/to/your/eeg_data.csv")
+           
+    except Exception as e:
+        print(f"Session failed: {e}")
+        return 1
+   
+    return 0
+
+if __name__ == "__main__":
+    # For Python 3.7+ compatibility
+    if sys.version_info >= (3, 7):
+        asyncio.run(main())
+    else:
+        loop = asyncio.get_event_loop()
+        try:
+            loop.run_until_complete(main())
+        finally:
+            loop.close()
