@@ -1,0 +1,754 @@
+
+import json
+import os
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional, Any
+from dataclasses import dataclass, asdict
+import numpy as np
+import pandas as pd
+from scipy import signal
+import ast
+import matplotlib.pyplot as plt
+
+@dataclass
+class EEGConfig:
+    """Centralized configuration for EEG data processing and analysis."""
+    # File Management
+    base_data_dir: str = r"C:\grad\headband\headband\PSYCHONOVA\Collected Data"
+    participant_name: str = "Default_Participant"
+    session_name: str = "Default_Session"
+    output_plots_dir: str = "eeg_plots"
+
+    # Signal Processing Parameters
+    sampling_rate: int = 256
+    segment_length: float = 2.0  # seconds
+
+    # Filtering Parameters
+    lowcut_freq: float = 0.5
+    highcut_freq: float = 50.0
+    notch_freq: float = 60.0
+    filter_order: int = 5
+
+    # Artifact Removal
+    artifact_threshold: float = 4.0
+    use_quality_check: bool = False
+
+    # Feature Extraction
+    freq_bands: Dict[str, tuple] = None
+
+    def __post_init__(self):
+        if self.freq_bands is None:
+            self.freq_bands = {
+                'delta': (0.5, 4),
+                'theta': (4, 8),
+                'alpha': (8, 12),
+                'beta': (12, 30),
+                'gamma': (30, 50)
+            }
+
+    def get_data_file_path(self, file_type: str = "raw") -> str:
+        """Generate file paths based on configuration."""
+        participant_dir = Path(self.base_data_dir) / self.participant_name
+        participant_dir.mkdir(parents=True, exist_ok=True)
+        if file_type == "raw":
+            return str(participant_dir / f"EEG_{self.session_name}.csv")
+        elif file_type == "features":
+            return str(participant_dir / f"EEG_features_{self.session_name}.csv")
+        elif file_type == "config":
+            return str(participant_dir / f"config_{self.session_name}.json")
+        elif file_type == "cognitive_analysis":
+            return str(participant_dir / f"EEG_cognitive_analysis_{self.session_name}.csv")
+        else:
+            return str(participant_dir / f"EEG_{file_type}_{self.session_name}.csv")
+
+    def save_config(self, file_path: Optional[str] = None):
+        """Save configuration to JSON file."""
+        if file_path is None:
+            file_path = self.get_data_file_path("config")
+        with open(file_path, 'w') as f:
+            json.dump(asdict(self), f, indent=2)
+
+    @classmethod
+    def load_config(cls, file_path: str) -> 'EEGConfig':
+        """Load configuration from JSON file."""
+        with open(file_path, 'r') as f:
+            config_dict = json.load(f)
+        return cls(**config_dict)
+
+class EEGDataProcessor:
+    """Wrapper for EEG data processing functionality."""
+    def __init__(self, config: EEGConfig):
+        self.config = config
+        self.logger = logging.getLogger(__name__ + ".Processor")
+        self.output_dir = Path(self.config.base_data_dir) / self.config.participant_name / self.config.output_plots_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def load_eeg_data(self, file_path: str) -> pd.DataFrame:
+        """Load and parse EEG data from CSV."""
+        try:
+            df = pd.read_csv(file_path)
+            self.logger.info(f"Loaded EEG data with {len(df)} records")
+            eeg_df = df[df['Data Type'] == 'EEG Data'].copy()
+            if eeg_df.empty:
+                self.logger.error("No EEG data found in the CSV file")
+                raise ValueError("No EEG data found in the CSV file")
+
+            def parse_tuple_list(tuple_str):
+                try:
+                    if pd.isna(tuple_str):
+                        self.logger.warning(f"NaN encountered in tuple string: {tuple_str}")
+                        return np.array([])
+                    tuple_list = ast.literal_eval(tuple_str)
+                    if isinstance(tuple_list, list) and len(tuple_list) == 3:
+                        first_tuple = tuple_list[0]
+                        if isinstance(first_tuple, tuple) and len(first_tuple) >= 1:
+                            try:
+                                return np.array([float(first_tuple[0])])
+                            except (ValueError, TypeError) as e:
+                                self.logger.warning(f"Invalid value in first tuple: {first_tuple}, error: {e}")
+                                return np.array([])
+                        else:
+                            self.logger.warning(f"Invalid first tuple: {first_tuple}")
+                            return np.array([])
+                    else:
+                        self.logger.warning(f"Expected list of 3 tuples, got: {tuple_list}")
+                        return np.array([])
+                except (ValueError, SyntaxError) as e:
+                    self.logger.warning(f"Error parsing tuple string: {tuple_str}, error: {e}")
+                    return np.array([])
+
+            eeg_df['F1'] = eeg_df['Left Channel'].apply(parse_tuple_list)
+            eeg_df['F2'] = eeg_df['Right Channel'].apply(parse_tuple_list)
+            eeg_df = eeg_df[
+                (eeg_df['F1'].apply(lambda x: len(x) == 1)) &
+                (eeg_df['F2'].apply(lambda x: len(x) == 1))
+            ]
+            self.logger.info(f"EEG records after parsing and filtering: {len(eeg_df)}")
+            if eeg_df.empty:
+                self.logger.error("No valid EEG records after parsing")
+                raise ValueError("No valid EEG records after parsing")
+            if self.config.use_quality_check:
+                self.logger.info("Quality check enabled but not implemented")
+            return eeg_df
+        except Exception as e:
+            self.logger.error(f"Failed to load EEG data: {str(e)}")
+            raise
+
+    def apply_filters(self, data: np.ndarray) -> np.ndarray:
+        """Apply bandpass and notch filters."""
+        try:
+            if data.shape[0] == 0 or data.shape[1] != 2:
+                self.logger.error(f"Invalid data shape for filtering: {data.shape}")
+                raise ValueError(f"Invalid data shape for filtering: {data.shape}")
+            def butter_bandpass(lowcut, highcut, fs, order):
+                nyq = 0.5 * fs
+                low = lowcut / nyq
+                high = highcut / nyq
+                b, a = signal.butter(order, [low, high], btype='band')
+                return b, a
+            def notch_filter(freq, fs, quality_factor=30):
+                b, a = signal.iirnotch(freq, quality_factor, fs)
+                return b, a
+            filtered_data = np.copy(data)
+            b, a = butter_bandpass(
+                self.config.lowcut_freq,
+                self.config.highcut_freq,
+                self.config.sampling_rate,
+                self.config.filter_order
+            )
+            for i in range(data.shape[1]):
+                filtered_data[:, i] = signal.filtfilt(b, a, data[:, i])
+            b, a = notch_filter(self.config.notch_freq, self.config.sampling_rate)
+            for i in range(data.shape[1]):
+                filtered_data[:, i] = signal.filtfilt(b, a, filtered_data[:, i])
+            self.logger.info("Applied bandpass and notch filters")
+            return filtered_data
+        except Exception as e:
+            self.logger.error(f"Filtering failed: {str(e)}")
+            raise
+
+    def remove_artifacts(self, data: np.ndarray) -> np.ndarray:
+        """Remove artifacts using z-score thresholding."""
+        try:
+            if data.shape[0] == 0:
+                self.logger.error("Empty data array for artifact removal")
+                raise ValueError("Empty data array for artifact removal")
+            z_scores = (data - np.mean(data, axis=0)) / np.std(data, axis=0)
+            outliers = np.abs(z_scores) > self.config.artifact_threshold
+            cleaned_data = np.copy(data)
+            for i in range(data.shape[1]):
+                median = np.median(data[:, i])
+                cleaned_data[outliers[:, i], i] = median
+            self.logger.info(f"Removed artifacts from {np.sum(outliers)} samples")
+            return cleaned_data
+        except Exception as e:
+            self.logger.error(f"Artifact removal failed: {str(e)}")
+            raise
+
+    def normalize_data(self, data: np.ndarray) -> np.ndarray:
+        """Normalize data to zero mean and unit variance."""
+        try:
+            if data.shape[0] == 0:
+                self.logger.error("Empty data array for normalization")
+                raise ValueError("Empty data array for normalization")
+            std = np.std(data, axis=0)
+            std[std == 0] = 1
+            normalized_data = (data - np.mean(data, axis=0)) / std
+            self.logger.info("Normalized EEG data")
+            return normalized_data
+        except Exception as e:
+            self.logger.error(f"Normalization failed: {str(e)}")
+            raise
+
+    def segment_data(self, data: np.ndarray) -> np.ndarray:
+        """Segment data into fixed-length windows."""
+        try:
+            if data.shape[0] == 0:
+                self.logger.error("Empty data array for segmentation")
+                raise ValueError("Empty data array for segmentation")
+            samples_per_segment = int(self.config.sampling_rate * self.config.segment_length)
+            if samples_per_segment <= 0:
+                self.logger.error("Invalid segment length or sampling rate")
+                raise ValueError("Invalid segment length or sampling rate")
+            n_segments = len(data) // samples_per_segment
+            if n_segments == 0:
+                self.logger.warning("Data too short for segmentation; using single segment")
+                return data[np.newaxis, :, :]
+            segments = data[:n_segments * samples_per_segment].reshape(n_segments, samples_per_segment, -1)
+            self.logger.info(f"Segmented data into {n_segments} segments of {samples_per_segment} samples each")
+            return segments
+        except Exception as e:
+            self.logger.error(f"Data segmentation failed: {str(e)}")
+            raise
+
+    def extract_features(self, data: np.ndarray) -> pd.DataFrame:
+        """Extract comprehensive features from EEG data."""
+        try:
+            if data.ndim not in [2, 3]:
+                self.logger.error(f"Invalid data dimensions for feature extraction: {data.ndim}")
+                raise ValueError(f"Invalid data dimensions for feature extraction: {data.ndim}")
+            features_list = []
+            channel_labels = ['F1', 'F2']
+            if data.ndim == 3:
+                for seg_idx in range(data.shape[0]):
+                    segment = data[seg_idx]
+                    if segment.shape[1] != 2:
+                        self.logger.warning(f"Invalid segment shape at index {seg_idx}: {segment.shape}")
+                        continue
+                    seg_features = self._extract_segment_features(segment, seg_idx, channel_labels)
+                    features_list.append(seg_features)
+            else:
+                if data.shape[1] != 2:
+                    self.logger.error(f"Invalid data shape for feature extraction: {data.shape}")
+                    raise ValueError(f"Invalid data shape for feature extraction: {data.shape}")
+                seg_features = self._extract_segment_features(data, 0, channel_labels)
+                features_list.append(seg_features)
+            if not features_list:
+                self.logger.error("No features extracted")
+                raise ValueError("No features extracted")
+            features_df = pd.DataFrame(features_list)
+            self.logger.info(f"Extracted features for {len(features_list)} segments")
+            self.logger.debug(f"Feature columns: {list(features_df.columns)}")
+            return features_df
+        except Exception as e:
+            self.logger.error(f"Feature extraction failed: {str(e)}")
+            raise
+
+    def _extract_segment_features(self, segment: np.ndarray, seg_idx: int, channel_labels: List[str]) -> Dict[str, Any]:
+        """Extract features from a single segment."""
+        features = {
+            'segment_index': seg_idx,
+            'segment_length': len(segment),
+            'timestamp': datetime.now().isoformat()
+        }
+        for ch_idx, ch_label in enumerate(channel_labels):
+            if ch_idx >= segment.shape[1]:
+                self.logger.warning(f"Channel index {ch_idx} exceeds segment shape {segment.shape}")
+                continue
+            channel_data = segment[:, ch_idx]
+            features[f'{ch_label}_mean'] = np.mean(channel_data)
+            features[f'{ch_label}_std'] = np.std(channel_data)
+            features[f'{ch_label}_var'] = np.var(channel_data)
+            features[f'{ch_label}_rms'] = np.sqrt(np.mean(channel_data**2))
+            features[f'{ch_label}_peak_to_peak'] = np.ptp(channel_data)
+            features[f'{ch_label}_skewness'] = self._calculate_skewness(channel_data)
+            features[f'{ch_label}_kurtosis'] = self._calculate_kurtosis(channel_data)
+            try:
+                freqs, psd = signal.welch(
+                    channel_data,
+                    fs=self.config.sampling_rate,
+                    nperseg=min(len(channel_data), self.config.sampling_rate * 2)
+                )
+                total_power = np.trapz(psd, freqs)
+                features[f'{ch_label}_total_power'] = total_power
+                for band, (low, high) in self.config.freq_bands.items():
+                    band_idx = (freqs >= low) & (freqs <= high)
+                    if np.any(band_idx):
+                        band_power = np.trapz(psd[band_idx], freqs[band_idx])
+                        features[f'{ch_label}_{band}_power'] = band_power
+                        features[f'{ch_label}_{band}_relative_power'] = (
+                            band_power / total_power if total_power > 0 else 0
+                        )
+                        if np.any(psd[band_idx]):
+                            peak_freq_idx = np.argmax(psd[band_idx])
+                            features[f'{ch_label}_{band}_peak_freq'] = freqs[band_idx][peak_freq_idx]
+                features[f'{ch_label}_spectral_centroid'] = np.sum(freqs * psd) / np.sum(psd) if np.sum(psd) > 0 else 0
+                features[f'{ch_label}_spectral_bandwidth'] = self._calculate_spectral_bandwidth(freqs, psd)
+                features[f'{ch_label}_spectral_rolloff'] = self._calculate_spectral_rolloff(freqs, psd)
+            except Exception as e:
+                self.logger.warning(f"Failed to compute frequency features for {ch_label}: {e}")
+        try:
+            if segment.shape[1] >= 2:
+                left_ch = segment[:, 0]
+                right_ch = segment[:, 1]
+                if len(left_ch) > 1 and len(right_ch) > 1:
+                    correlation = np.corrcoef(left_ch, right_ch)[0, 1]
+                    if not np.isnan(correlation):
+                        features['coherence_F1_F2'] = correlation
+                f1_power = features.get('F1_total_power', 0)
+                f2_power = features.get('F2_total_power', 0)
+                features['hemispheric_asymmetry'] = (f1_power - f2_power) / (f1_power + f2_power) if (f1_power + f2_power) > 0 else 0
+        except Exception as e:
+            self.logger.warning(f"Failed to compute cross-channel features: {e}")
+        return features
+
+    def _calculate_skewness(self, data: np.ndarray) -> float:
+        """Calculate skewness of the data."""
+        try:
+            mean = np.mean(data)
+            std = np.std(data)
+            if std == 0:
+                return 0
+            return np.mean(((data - mean) / std) ** 3)
+        except:
+            return 0
+
+    def _calculate_kurtosis(self, data: np.ndarray) -> float:
+        """Calculate kurtosis of the data."""
+        try:
+            mean = np.mean(data)
+            std = np.std(data)
+            if std == 0:
+                return 0
+            return np.mean(((data - mean) / std) ** 4) - 3
+        except:
+            return 0
+
+    def _calculate_spectral_bandwidth(self, freqs: np.ndarray, psd: np.ndarray) -> float:
+        """Calculate spectral bandwidth."""
+        try:
+            centroid = np.sum(freqs * psd) / np.sum(psd) if np.sum(psd) > 0 else 0
+            bandwidth = np.sqrt(np.sum(((freqs - centroid) ** 2) * psd) / np.sum(psd)) if np.sum(psd) > 0 else 0
+            return bandwidth
+        except:
+            return 0
+
+    def _calculate_spectral_rolloff(self, freqs: np.ndarray, psd: np.ndarray, rolloff_percent: float = 0.85) -> float:
+        """Calculate spectral rolloff frequency."""
+        try:
+            total_power = np.sum(psd)
+            if total_power == 0:
+                return 0
+            cumsum_power = np.cumsum(psd)
+            rolloff_threshold = rolloff_percent * total_power
+            rolloff_idx = np.where(cumsum_power >= rolloff_threshold)[0]
+            if len(rolloff_idx) > 0:
+                return freqs[rolloff_idx[0]]
+            else:
+                return freqs[-1]
+        except:
+            return 0
+
+    def create_visualizations(self, data: np.ndarray, features_df: pd.DataFrame = None) -> List[str]:
+        """Create comprehensive visualizations."""
+        try:
+            if data.shape[0] == 0 or data.shape[1] != 2:
+                self.logger.error(f"Invalid data shape for visualization: {data.shape}")
+                raise ValueError(f"Invalid data shape for visualization: {data.shape}")
+            plot_files = []
+            channel_labels = ['F1', 'F2']
+            # Time Series Plot
+            plt.figure(figsize=(15, 5))
+            for i, label in enumerate(channel_labels):
+                if i < data.shape[1]:
+                    plt.subplot(1, 2, i + 1)
+                    time_axis = np.arange(len(data)) / self.config.sampling_rate
+                    plt.plot(time_axis, data[:, i])
+                    plt.title(f'Channel {label}')
+                    plt.xlabel('Time (s)')
+                    plt.ylabel('Amplitude (μV)')
+                    plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            time_series_file = self.output_dir / f"eeg_time_series_{self.config.session_name}.png"
+            plt.savefig(time_series_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            plot_files.append(str(time_series_file))
+            self.logger.info(f"Saved time series plot: {time_series_file}")
+            # PSD Plot
+            plt.figure(figsize=(15, 5))
+            for i, label in enumerate(channel_labels):
+                if i < data.shape[1]:
+                    plt.subplot(1, 2, i + 1)
+                    freqs, psd = signal.welch(
+                        data[:, i],
+                        fs=self.config.sampling_rate,
+                        nperseg=min(len(data), self.config.sampling_rate * 4)
+                    )
+                    plt.semilogy(freqs, psd)
+                    plt.title(f'PSD - Channel {label}')
+                    plt.xlabel('Frequency (Hz)')
+                    plt.ylabel('Power Spectral Density')
+                    plt.xlim(0, 50)
+                    plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            psd_file = self.output_dir / f"eeg_psd_{self.config.session_name}.png"
+            plt.savefig(psd_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            plot_files.append(str(psd_file))
+            self.logger.info(f"Saved PSD plot: {psd_file}")
+            # Band Power Visualization
+            if features_df is not None and not features_df.empty:
+                self._plot_band_powers(features_df, plot_files)
+            else:
+                self.logger.warning("No features DataFrame provided or empty; skipping band power plots")
+            # Spectrogram
+            plt.figure(figsize=(15, 5))
+            for i, label in enumerate(channel_labels):
+                if i < data.shape[1]:
+                    plt.subplot(1, 2, i + 1)
+                    f, t, Sxx = signal.spectrogram(
+                        data[:, i],
+                        fs=self.config.sampling_rate,
+                        nperseg=min(256, len(data)//4)
+                    )
+                    plt.pcolormesh(t, f, 10 * np.log10(Sxx + 1e-10), shading='gouraud')
+                    plt.title(f'Spectrogram - Channel {label}')
+                    plt.xlabel('Time (s)')
+                    plt.ylabel('Frequency (Hz)')
+                    plt.ylim(0, 50)
+                    plt.colorbar(label='Power (dB)')
+            plt.tight_layout()
+            spectrogram_file = self.output_dir / f"eeg_spectrogram_{self.config.session_name}.png"
+            plt.savefig(spectrogram_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            plot_files.append(str(spectrogram_file))
+            self.logger.info(f"Saved spectrogram plot: {spectrogram_file}")
+            # Correlation Matrix
+            if data.shape[1] > 1:
+                plt.figure(figsize=(8, 6))
+                correlation_matrix = np.corrcoef(data.T)
+                im = plt.imshow(correlation_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+                plt.colorbar(im, label='Correlation Coefficient')
+                plt.title('Channel Correlation Matrix')
+                plt.xticks(range(len(channel_labels)), channel_labels)
+                plt.yticks(range(len(channel_labels)), channel_labels)
+                for i in range(correlation_matrix.shape[0]):
+                    for j in range(correlation_matrix.shape[1]):
+                        plt.text(j, i, f'{correlation_matrix[i, j]:.2f}',
+                                ha='center', va='center', color='black')
+                plt.tight_layout()
+                corr_file = self.output_dir / f"eeg_correlation_{self.config.session_name}.png"
+                plt.savefig(corr_file, dpi=300, bbox_inches='tight')
+                plt.close()
+                plot_files.append(str(corr_file))
+                self.logger.info(f"Saved correlation matrix plot: {corr_file}")
+            self.logger.info(f"Created {len(plot_files)} visualization files")
+            return plot_files
+        except Exception as e:
+            self.logger.error(f"Visualization creation failed: {str(e)}")
+            return []
+
+    def _plot_band_powers(self, features_df: pd.DataFrame, plot_files: List[str]):
+        """Create band power visualization plots."""
+        try:
+            bands = list(self.config.freq_bands.keys())
+            channel_labels = ['F1', 'F2']
+            plt.figure(figsize=(15, 10))
+            for band_idx, band in enumerate(bands):
+                plt.subplot(2, 3, band_idx + 1)
+                band_powers = []
+                for ch_label in channel_labels:
+                    power_col = f'{ch_label}_{band}_power'
+                    if power_col in features_df.columns:
+                        band_powers.append(features_df[power_col].mean())
+                    else:
+                        self.logger.warning(f"Column {power_col} not found in features_df")
+                        band_powers.append(0)
+                plt.bar(range(len(channel_labels)), band_powers)
+                plt.title(f'{band.capitalize()} Band Power ({self.config.freq_bands[band][0]}-{self.config.freq_bands[band][1]} Hz)')
+                plt.xlabel('Channel')
+                plt.ylabel('Power')
+                plt.xticks(range(len(channel_labels)), channel_labels)
+                plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            band_power_file = self.output_dir / f"eeg_band_powers_{self.config.session_name}.png"
+            plt.savefig(band_power_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            plot_files.append(str(band_power_file))
+            self.logger.info(f"Saved band power plot: {band_power_file}")
+        except Exception as e:
+            self.logger.warning(f"Failed to create band power plots: {e}")
+
+    def process_data(self, file_path: str) -> Dict[str, Any]:
+        """Complete data processing pipeline."""
+        try:
+            self.logger.info("Starting EEG data processing pipeline")
+            eeg_df = self.load_eeg_data(file_path)
+            if eeg_df.empty:
+                raise ValueError("No valid EEG data found")
+            all_data = []
+            for _, row in eeg_df.iterrows():
+                f1_data = row['F1']
+                f2_data = row['F2']
+                if len(f1_data) == 1 and len(f2_data) == 1:
+                    combined = np.hstack([f1_data, f2_data])
+                    all_data.append(combined)
+            if not all_data:
+                raise ValueError("No valid data points found after parsing")
+            data = np.array(all_data)
+            self.logger.info(f"Loaded data shape: {data.shape}")
+            if data.shape[1] != 2:
+                self.logger.error(f"Unexpected data shape: {data.shape}, expected 2 channels")
+                raise ValueError(f"Unexpected data shape: {data.shape}")
+            self.logger.info("Applying filters...")
+            filtered_data = self.apply_filters(data)
+            self.logger.info("Removing artifacts...")
+            cleaned_data = self.remove_artifacts(filtered_data)
+            self.logger.info("Normalizing data...")
+            normalized_data = self.normalize_data(cleaned_data)
+            self.logger.info("Segmenting data...")
+            segmented_data = self.segment_data(normalized_data)
+            self.logger.info("Extracting features...")
+            features_df = self.extract_features(segmented_data)
+            features_file = self.config.get_data_file_path("features")
+            features_df.to_csv(features_file, index=False)
+            self.logger.info(f"Features saved to: {features_file}")
+            self.logger.info("Creating visualizations...")
+            plot_files = self.create_visualizations(normalized_data, features_df)
+            summary = {
+                'total_samples': len(data),
+                'total_segments': len(segmented_data) if segmented_data.ndim == 3 else 1,
+                'features_extracted': len(features_df.columns),
+                'processing_duration': f"{self.config.segment_length}s segments",
+                'output_files': {
+                    'features': features_file,
+                    'plots': plot_files
+                },
+                'data_quality': {
+                    'mean_amplitude': np.mean(np.abs(normalized_data)),
+                    'snr_estimate': self._estimate_snr(normalized_data)
+                }
+            }
+            self.logger.info("EEG data processing completed successfully")
+            return summary
+        except Exception as e:
+            self.logger.error(f"Data processing failed: {str(e)}")
+            raise
+
+    def _estimate_snr(self, data: np.ndarray) -> float:
+        """Estimate signal-to-noise ratio."""
+        try:
+            signal_power = np.mean(data ** 2)
+            diff = np.diff(data, axis=0)
+            noise_power = np.mean(diff ** 2)
+            if noise_power > 0:
+                snr = 10 * np.log10(signal_power / noise_power)
+                return float(snr)
+            else:
+                return float('inf')
+        except:
+            return 0.0
+
+class CognitiveStateAnalyzer:
+    """Class to analyze cognitive states based on EEG features."""
+    def __init__(self, config: EEGConfig):
+        self.config = config
+        self.logger = logging.getLogger(__name__ + ".CognitiveStateAnalyzer")
+        self.state_thresholds = {
+            'relaxed': {
+                'alpha_relative_power': (0.3, 0.6),
+                'beta_relative_power': (0.0, 0.2),
+                'coherence': (0.0, 0.5),
+            },
+            'anxious': {
+                'alpha_relative_power': (0.0, 0.2),
+                'beta_relative_power': (0.3, 0.6),
+                'gamma_relative_power': (0.1, 0.4),
+            },
+            'focused': {
+                'alpha_relative_power': (0.2, 0.4),
+                'beta_relative_power': (0.2, 0.5),
+                'coherence': (0.5, 1.0),
+            },
+            'engaged': {
+                'beta_relative_power': (0.3, 0.6),
+                'gamma_relative_power': (0.1, 0.4),
+                'hemispheric_asymmetry': (0.1, 0.5),
+            }
+        }
+
+    def analyze_cognitive_states(self, features_df: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze cognitive states based on EEG features."""
+        try:
+            if features_df.empty:
+                self.logger.error("Empty features DataFrame provided")
+                raise ValueError("Empty features DataFrame provided")
+            state_scores = {
+                'relaxed': [],
+                'anxious': [],
+                'focused': [],
+                'engaged': []
+            }
+            for idx, row in features_df.iterrows():
+                segment_scores = self._analyze_segment(row)
+                for state in state_scores:
+                    state_scores[state].append(segment_scores[state])
+            aggregated_scores = {
+                state: np.mean(scores) if scores else 0.0
+                for state, scores in state_scores.items()
+            }
+            dominant_state = max(aggregated_scores, key=aggregated_scores.get)
+            analysis = {
+                'state_scores': aggregated_scores,
+                'dominant_state': dominant_state,
+                'segment_details': []
+            }
+            for idx, row in features_df.iterrows():
+                segment_scores = self._analyze_segment(row)
+                segment_details = {
+                    'segment_index': int(row['segment_index']),
+                    'timestamp': row['timestamp'],
+                    'scores': segment_scores,
+                    'key_features': {
+                        'F1_alpha_relative_power': row.get('F1_alpha_relative_power', 0.0),
+                        'F2_alpha_relative_power': row.get('F2_alpha_relative_power', 0.0),
+                        'F1_beta_relative_power': row.get('F1_beta_relative_power', 0.0),
+                        'F2_beta_relative_power': row.get('F2_beta_relative_power', 0.0),
+                        'F1_gamma_relative_power': row.get('F1_gamma_relative_power', 0.0),
+                        'F2_gamma_relative_power': row.get('F2_gamma_relative_power', 0.0),
+                        'coherence_F1_F2': row.get('coherence_F1_F2', 0.0),
+                        'hemispheric_asymmetry': row.get('hemispheric_asymmetry', 0.0)
+                    }
+                }
+                analysis['segment_details'].append(segment_details)
+            self.logger.info(f"Cognitive state analysis completed. Dominant state: {dominant_state}")
+            return analysis
+        except Exception as e:
+            self.logger.error(f"Cognitive state analysis failed: {str(e)}")
+            raise
+
+    def _analyze_segment(self, row: pd.Series) -> Dict[str, float]:
+        """Analyze cognitive states for a single segment."""
+        scores = {
+            'relaxed': 0.0,
+            'anxious': 0.0,
+            'focused': 0.0,
+            'engaged': 0.0
+        }
+        alpha_power = np.mean([
+            row.get('F1_alpha_relative_power', 0.0),
+            row.get('F2_alpha_relative_power', 0.0)
+        ])
+        beta_power = np.mean([
+            row.get('F1_beta_relative_power', 0.0),
+            row.get('F2_beta_relative_power', 0.0)
+        ])
+        gamma_power = np.mean([
+            row.get('F1_gamma_relative_power', 0.0),
+            row.get('F2_gamma_relative_power', 0.0)
+        ])
+        coherence = row.get('coherence_F1_F2', 0.0)
+        asymmetry = abs(row.get('hemispheric_asymmetry', 0.0))
+        for state, thresholds in self.state_thresholds.items():
+            score = 0.0
+            count = 0
+            for feature, (low, high) in thresholds.items():
+                if feature == 'alpha_relative_power':
+                    value = alpha_power
+                elif feature == 'beta_relative_power':
+                    value = beta_power
+                elif feature == 'gamma_relative_power':
+                    value = gamma_power
+                elif feature == 'coherence':
+                    value = coherence
+                elif feature == 'hemispheric_asymmetry':
+                    value = asymmetry
+                else:
+                    continue
+                if low <= value <= high:
+                    score += 1.0
+                elif value < low:
+                    if low == 0.0:
+                        score += 0.0
+                    else:
+                        score += max(0.0, 1.0 - (low - value) / low)
+                elif value > high:
+                    if high == 0.0:
+                        score += 0.0
+                    else:
+                        score += max(0.0, 1.0 - (value - high) / high)
+                count += 1
+            scores[state] = score / count if count > 0 else 0.0
+        return scores
+
+    def save_analysis(self, analysis: Dict[str, Any], file_path: str):
+        """Save cognitive state analysis to a file."""
+        try:
+            with open(file_path, 'w') as f:
+                json.dump(analysis, f, indent=2)
+            self.logger.info(f"Cognitive state analysis saved to: {file_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to save cognitive state analysis: {e}")
+            raise
+
+def create_example_config() -> EEGConfig:
+    """Create an example configuration."""
+    return EEGConfig(
+        participant_name="mai",
+        session_name="blank_1",
+        base_data_dir=r"C:\grad\headband\headband\PSYCHONOVA\Collected Data"
+    )
+
+def main():
+    """Main function for EEG data processing and cognitive state analysis."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('eeg_processing_analysis.log'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    config = create_example_config()
+    processor = EEGDataProcessor(config)
+    analyzer = CognitiveStateAnalyzer(config)
+    data_file = config.get_data_file_path("raw")
+    if os.path.exists(data_file):
+        try:
+            processing_results = processor.process_data(data_file)
+            print(f"Processing completed successfully!")
+            print(f"Results: {processing_results}")
+            features_file = processing_results['output_files']['features']
+            features_df = pd.read_csv(features_file)
+            analysis = analyzer.analyze_cognitive_states(features_df)
+            analysis_file = config.get_data_file_path("cognitive_analysis")
+            analyzer.save_analysis(analysis, analysis_file)
+            print("\nCognitive State Analysis:")
+            print(f"Dominant State: {analysis['dominant_state']}")
+            print("State Scores:")
+            for state, score in analysis['state_scores'].items():
+                print(f"  {state.capitalize()}: {score:.3f}")
+            print(f"Analysis saved to: {analysis_file}")
+        except Exception as e:
+            print(f"Processing or analysis failed: {e}")
+            return 1
+    else:
+        print(f"Data file not found: {data_file}")
+        return 1
+    return 0
+
+if __name__ == "__main__":
+    main()
